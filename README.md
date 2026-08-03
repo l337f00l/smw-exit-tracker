@@ -1,2 +1,169 @@
-# smw-exit-tracker
-SMW exit tracker for OBS
+# SMW Exit Tracker
+
+Live exit counter for Super Mario World hack streams, reading the game's own exit total straight out of SNES memory — on real hardware or in an emulator.
+
+Point it at an OBS text source and your exit count updates the moment you clear a level — no hotkeys, no manual editing between attempts, no counting on stream.
+
+```
+Exits 07/44
+```
+
+## Why read RAM instead of watching the screen
+
+The obvious approach is detecting the COURSE CLEAR banner with image matching. That runs into two problems fast: keyhole and orb exits never show a banner at all, and plenty of levels aren't supposed to count — switch palaces, bonus rooms, whatever the author flagged.
+
+Reading the game's own exit counter sidesteps both. The ROM already knows which goals increment the total, so the filtering is exact and needs no per-hack configuration. Clear a non-counting switch palace and the number simply doesn't move.
+
+## What you need
+
+Everyone needs these:
+
+| | |
+|---|---|
+| **Software** | [SNI](https://github.com/alttpo/sni/releases) — bridges your SNES (real or emulated) to your PC |
+| **Python** | 3.8+, plus `websocket-client` |
+| **OBS** | Any recent version with Python scripting configured |
+
+Plus **one** of:
+
+| | |
+|---|---|
+| **Hardware** | FXPak Pro or sd2snes with a USB cable, in any SNES — Super Nt, original console, whatever |
+| **Emulator** | BizHawk or snes9x-rr (via SNI's Lua connector), or RetroArch with a bsnes-mercury core |
+
+SNI presents both the same way, so the setup below is nearly identical either route.
+
+## Setup
+
+### 1. Install SNI
+
+Download the latest release from [github.com/alttpo/sni](https://github.com/alttpo/sni/releases), unzip it anywhere, and run `sni.exe`. It lives in your system tray and needs no configuration. Leave it running whenever you stream.
+
+**On hardware:** plug the FXPak into your PC over USB and boot a hack.
+
+**On emulator:** connect your emulator to SNI. BizHawk and snes9x-rr use SNI's `Connector.lua` script (bundled with SNI, in its `lua` folder) — open it via the emulator's Lua console while your ROM is running. RetroArch needs network commands enabled in its settings; SNI finds it from there.
+
+Either way, confirm SNI can see it:
+
+```
+python smw_exit_tracker.py devices
+```
+
+If both an emulator and a pak show up, note part of the name you want — you'll pin it with `--device` on the CLI and the "Device filter" box in OBS. Otherwise the script takes whatever it finds first, which is fine for a single device.
+
+### 2. Install the Python dependency
+
+Important: OBS uses its own Python installation, which is often *not* the one on your PATH. In OBS, go to **Tools → Scripts → Python Settings** and note the path shown there. Install using that exact interpreter:
+
+```
+C:\Python312\python.exe -m pip install websocket-client
+```
+
+If that fails with a permissions error, either run the terminal as Administrator or add `--user`.
+
+### 3. Find your counter address
+
+The address the counter lives at can vary between hacks, so confirm it on your own setup. With the hack running and SNI up:
+
+```
+python smw_exit_tracker.py scan
+```
+
+(Add `--device fxpak` or `--device bizhawk` if you have more than one connected.)
+
+It snapshots memory, waits for you to clear a level, then lists every byte that went up by exactly one. Clear two or three levels and the list narrows to a single address — usually `F51F2E`.
+
+Confirm it with:
+
+```
+python smw_exit_tracker.py probe F51F2E
+```
+
+This prints the counter alongside the game mode as you play. Move between the title screen, file select, overworld, and a level. You should see the counter hold your real total and tick up when you clear something.
+
+### 4. Load the OBS script
+
+**Tools → Scripts → +**, pick `smw_exit_tracker.py`, then fill in:
+
+- **Exits text source** — the text source to update
+- **Counter address** — whatever `scan` found
+
+The other settings have working defaults. Make sure your text source contains something in `07/44` form; the script rewrites only the left number and leaves the total untouched, so a separate script can manage that half.
+
+Load a save file and the count should appear.
+
+## Settings
+
+| Setting | Default | What it does |
+|---|---|---|
+| Exits text source | — | Which OBS text source to update |
+| SNI WebSocket URL | `ws://localhost:23074` | Where SNI listens |
+| Device filter | blank | Substring of a device name; blank uses the first found |
+| Counter address | `F51F2E` | The exit counter byte |
+| Game mode address | `F50100` | Byte telling us what the game is doing |
+| Minimum game mode | `0B` | Below this, no file is loaded |
+| Maximum game mode | `1F` | Above this, the value isn't a real mode |
+| Arm on game mode | `0E` | Overworld — must be reached before trusting reads |
+| Fallback total | `96` | Used if the text source has no `/total` |
+| Poll interval | `200` ms | How often to read |
+
+## Streaming checklist
+
+1. Game running — console with the FXPak plugged in, or your emulator with its connector script active
+2. SNI running in the tray
+3. OBS open — the script starts polling by itself
+
+That's the whole routine. Consider adding SNI to your Windows startup so step 2 stops being something to remember.
+
+## ⚠️ SA-1 hacks: emulator only
+
+**SA-1 hacks will not work on an FXPak Pro.** This isn't a limitation of this script.
+
+The pak exposes WRAM to your PC by having its FPGA watch the SNES bus and record what passes by. SNI's documentation includes a feature matrix for pak firmware v1.11.0 showing which enhancement chips support that WRAM mirror — SA-1 is listed as unsupported, alongside CX4, GSU, OBC1, S-DD1 and SGB. The pak plays SA-1 hacks perfectly well; it just can't show your PC the memory while doing so.
+
+**If you play SA-1 hacks, use an emulator.** BizHawk reads memory directly rather than through bus-watching, so the restriction doesn't apply. Note that the SA-1 patch relocates much of SMW's RAM, so the counter is likely at a different address than on vanilla-base ROMs — run `scan` again while running an SA-1 hack and keep the two addresses separate.
+
+**Still untested:** nobody has confirmed the counter address for an SA-1 hack yet. If you find it, an issue or PR would be genuinely useful — that's the one gap left in this setup.
+
+## Emulator support
+
+SNI supports emulators through two routes:
+
+- **Lua Bridge** — BizHawk and snes9x-rr, via SNI's `Connector.lua`
+- **RetroArch** — with a bsnes-mercury core and network commands enabled
+
+**MesenCE is not supported.** SNI has no driver for it, and Mesen's Lua API doesn't provide the socket support a bridge connector would need. If you want a Mesen-family emulator to work with SNI, that request belongs upstream with SNI or MesenCE, not here.
+
+## Troubleshooting
+
+**Nothing appears at all.** Run `python smw_exit_tracker.py devices` — if your console or emulator isn't listed, the problem is between SNI and the game, not this script. On emulator, that usually means the connector Lua script isn't running. Then try `probe`, which fails with a clear error, unlike the OBS script, which quietly retries.
+
+**Wrong device attached.** With an emulator and a pak both connected, set the Device filter to part of the name you want.
+
+**Script won't load in OBS.** Almost always `websocket-client` installed to the wrong Python. Recheck the interpreter path in Tools → Scripts → Python Settings.
+
+**Number is stuck.** The script won't trust readings until it sees the overworld (game mode `0E`). If a hack drops you straight into a level without an overworld, clear the "Arm on game mode" field.
+
+**Wrong number briefly on hack swap.** Should be handled, but if it persists, the total in your text source may not have changed — the swap detection keys off that. Clearing and resetting the counter address in the script settings forces a reset.
+
+**Using QUsb2Snes instead of SNI.** Set the URL to `ws://localhost:8080`. Note that SNI disables port 8080 by default, so if you're on SNI, stick with 23074.
+
+## How it works
+
+Every poll, the script reads two bytes over USB: a game mode byte and the exit counter. Several guards decide whether the reading is trustworthy:
+
+- **Range check.** During a ROM load, WRAM reads as `0x55` filler. A mode outside the valid range means the memory isn't holding real game state.
+- **Arming.** The title screen demo plays an actual level, so it clears a naive mode check while no file is loaded — and a freshly loaded ROM still holds the previous hack's leftovers. Readings are only trusted after the overworld has been reached, which the demo never does.
+- **Re-check after reading.** The two bytes are separate USB round trips. If the console left the game in between, the sample is torn and gets thrown away.
+- **Drop confirmation.** A decrease has to persist across several reads before it's accepted, riding out garbage during a file load.
+- **Swap detection.** If the total in the text source changes, a new hack was loaded and the held count is dropped rather than carried over.
+
+Console resets hold the last known value until a file is loaded again, rather than flashing zero on stream.
+
+## Credits
+
+Built on the usb2snes protocol via [SNI](https://github.com/alttpo/sni) by jsd1982.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
