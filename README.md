@@ -51,6 +51,8 @@ python smw_exit_tracker.py devices
 
 If both an emulator and a pak show up, note part of the name you want — you'll pin it with `--device` on the CLI and the "Device filter" box in OBS. Otherwise the script takes whatever it finds first, which is fine for a single device.
 
+Note that SNI names emulators after the connection type, so BizHawk shows up as something like `luabridge://127.0.0.1:62748` rather than "BizHawk". You can still type `--device bizhawk` — the script maps the common names (`bizhawk`, `snes9x`, `fxpak`, `sd2snes`) to what SNI actually reports.
+
 ### 2. Install the Python dependency
 
 Important: OBS uses its own Python installation, which is often *not* the one on your PATH. In OBS, go to **Tools → Scripts → Python Settings** and note the path shown there. Install using that exact interpreter:
@@ -86,7 +88,8 @@ This prints the counter alongside the game mode as you play. Move between the ti
 **Tools → Scripts → +**, pick `smw_exit_tracker.py`, then fill in:
 
 - **Exits text source** — the text source to update
-- **Counter address** — whatever `scan` found
+- **Hack type** — leave on *Vanilla-base*, which sets the addresses for you. *Custom addresses* lets you hand-edit them if `scan` found something unusual.
+- **Device filter** — leave blank for a single device; set to `bizhawk` or `fxpak` if both are connected
 
 The other settings have working defaults. Make sure your text source contains something in `07/44` form; the script rewrites only the left number and leaves the total untouched, so a separate script can manage that half.
 
@@ -97,13 +100,14 @@ Load a save file and the count should appear.
 | Setting | Default | What it does |
 |---|---|---|
 | Exits text source | — | Which OBS text source to update |
+| Hack type | Vanilla-base | Preset addresses; choose Custom to edit them by hand |
 | SNI WebSocket URL | `ws://localhost:23074` | Where SNI listens |
 | Device filter | blank | Substring of a device name; blank uses the first found |
 | Counter address | `F51F2E` | The exit counter byte |
 | Game mode address | `F50100` | Byte telling us what the game is doing |
 | Minimum game mode | `0B` | Below this, no file is loaded |
 | Maximum game mode | `1F` | Above this, the value isn't a real mode |
-| Arm on game mode | `0E` | Overworld — must be reached before trusting reads |
+| Arm on game modes | `0A,0E` | Comma-separated; one must be seen before trusting reads |
 | Fallback total | `96` | Used if the text source has no `/total` |
 | Poll interval | `200` ms | How often to read |
 
@@ -115,15 +119,15 @@ Load a save file and the count should appear.
 
 That's the whole routine. Consider adding SNI to your Windows startup so step 2 stops being something to remember.
 
-## ⚠️ SA-1 hacks: emulator only
+## SA-1 hacks: not supported
 
-**SA-1 hacks will not work on an FXPak Pro.** This isn't a limitation of this script.
+**SA-1 hacks aren't supported.** Count those exits by hand.
 
-The pak exposes WRAM to your PC by having its FPGA watch the SNES bus and record what passes by. SNI's documentation includes a feature matrix for pak firmware v1.11.0 showing which enhancement chips support that WRAM mirror — SA-1 is listed as unsupported, alongside CX4, GSU, OBC1, S-DD1 and SGB. The pak plays SA-1 hacks perfectly well; it just can't show your PC the memory while doing so.
+On an FXPak Pro they can't work at all. The pak exposes memory to your PC by having its FPGA watch the SNES bus, and SNI's feature matrix for firmware v1.11.0 lists SA-1 among the chips where that mirror isn't available — alongside CX4, GSU, OBC1, S-DD1 and SGB. The pak plays SA-1 hacks perfectly; it just can't show your PC the memory while doing so. Confirmed by testing: every byte reads as constant `0x55` and never changes, even across a full level clear.
 
-**If you play SA-1 hacks, use an emulator.** BizHawk reads memory directly rather than through bus-watching, so the restriction doesn't apply. Note that the SA-1 patch relocates much of SMW's RAM, so the counter is likely at a different address than on vanilla-base ROMs — run `scan` again while running an SA-1 hack and keep the two addresses separate.
+Under emulation the memory is readable, but SA-1 relocates SMW's variables out of WRAM, so the stock addresses don't apply. Rather than ship a half-supported path, this tool sticks to vanilla-base hacks — which is the large majority of what gets made.
 
-**Still untested:** nobody has confirmed the counter address for an SA-1 hack yet. If you find it, an issue or PR would be genuinely useful — that's the one gap left in this setup.
+*Experimenting anyway?* Choose **Custom addresses** in the OBS settings and run `scan` to find where your hack keeps its counter. Nothing stops you; it's just not a configuration this project supports or tests.
 
 ## Emulator support
 
@@ -140,9 +144,11 @@ SNI supports emulators through two routes:
 
 **Wrong device attached.** With an emulator and a pak both connected, set the Device filter to part of the name you want.
 
+**Everything reads as `0x55` on an emulator.** Wrong core. SNI's connector reads BizHawk's System Bus memory domain, which the Snes9x core doesn't expose — switch to BSNES under Config → Cores → SNES, reload the ROM, and restart `Connector.lua`. BizHawk's Lua console shows `Unable to find domain: System Bus` when this is the problem.
+
 **Script won't load in OBS.** Almost always `websocket-client` installed to the wrong Python. Recheck the interpreter path in Tools → Scripts → Python Settings.
 
-**Number is stuck.** The script won't trust readings until it sees the overworld (game mode `0E`). If a hack drops you straight into a level without an overworld, clear the "Arm on game mode" field.
+**Number is stuck.** The script won't trust readings until it sees one of the arm modes. Hub-world hacks with no overworld never reach mode `0E`, which is why `0A` (file load) is in the default list. If a hack still won't arm, run `probe`, note which modes actually appear, and add one that only occurs after a file is loaded — or clear the field entirely to disable arming.
 
 **Wrong number briefly on hack swap.** Should be handled, but if it persists, the total in your text source may not have changed — the swap detection keys off that. Clearing and resetting the counter address in the script settings forces a reset.
 
