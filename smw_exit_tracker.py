@@ -39,6 +39,26 @@ except ImportError:
 
 DEFAULT_URL = "ws://localhost:23074"  # 8080 is the deprecated legacy port
 APP_NAME = "SMW Exit Overlay"
+
+# SNI names emulator devices after the transport, not the emulator: BizHawk and
+# snes9x-rr both show up as luabridge://host:port. Map what people actually type.
+# Address profiles. Vanilla-base hacks keep SMW's variables in WRAM, which is
+# what the FXPak mirrors and what emulators expose. Anything else goes through
+# Custom addresses after a scan.
+PROFILES = {
+    "vanilla": {"address": "F51F2E", "gate_addr": "F50100", "arm_mode": "0A,0E"},
+}
+
+DEVICE_ALIASES = {
+    "bizhawk": "luabridge",
+    "snes9x": "luabridge",
+    "emu": "luabridge",
+    "emulator": "luabridge",
+    "lua": "luabridge",
+    "fxpak": "fxpakpro",
+    "sd2snes": "fxpakpro",
+    "pak": "fxpakpro",
+}
 WRAM_BASE = 0xF50000
 LOWRAM_SIZE = 0x2000  # $7E:0000-$7E:1FFF covers SMW's working variables
 
@@ -72,10 +92,13 @@ class Usb2Snes:
         # With both an emulator and a pak connected, "first device" is a coin
         # flip — let the user pin one by substring (e.g. "fxpak", "bizhawk").
         if self.device_filter:
-            matches = [d for d in self.devices if self.device_filter in d.lower()]
+            wanted = DEVICE_ALIASES.get(self.device_filter, self.device_filter)
+            matches = [d for d in self.devices if wanted in d.lower()]
             if not matches:
-                raise RuntimeError("No device matching %r. Found: %s"
-                                   % (self.device_filter, ", ".join(self.devices)))
+                raise RuntimeError(
+                    "No device matching %r. Found: %s\n"
+                    "(Emulators appear as luabridge://... rather than by name.)"
+                    % (self.device_filter, ", ".join(self.devices)))
             self.device = matches[0]
         else:
             self.device = self.devices[0]
@@ -118,6 +141,42 @@ class Usb2Snes:
 # CLI: address discovery
 # --------------------------------------------------------------------------
 
+def warn_if_wram_unavailable(snes):
+    """Detect the 0x55 filler that means the WRAM mirror isn't populated.
+
+    On an FXPak Pro this is what SA-1 hacks look like: the pak plays them fine,
+    but its FPGA can't expose their memory, so every byte reads as filler.
+    """
+    try:
+        sample = snes.read(WRAM_BASE, 0x40)
+    except Exception:
+        return False
+    if len(set(sample)) == 1:
+        print("\n  !! Memory reads as constant 0x%02X — nothing real is being"
+              " exposed here.\n" % sample[0])
+        print("     On an FXPak Pro: expected for SA-1 hacks. The pak plays")
+        print("     them but cannot mirror their RAM. Use an emulator instead.\n")
+        print("     On an emulator: usually the wrong core. SNI's connector")
+        print("     reads through BizHawk's System Bus domain, which the")
+        print("     Snes9x core does not expose. Switch to BSNES under")
+        print("     Config -> Cores -> SNES, reload the ROM, and restart the")
+        print("     connector script. Check BizHawk's Lua console for")
+        print("     'Unable to find domain: System Bus'.\n")
+        return True
+    return False
+
+
+def snes_label(addr):
+    """Human-readable SNES address for an FX Pak Pro address, where possible."""
+    if WRAM_BASE <= addr < WRAM_BASE + 0x20000:
+        offset = addr - WRAM_BASE
+        bank = 0x7E + (offset >> 16)
+        return "($%02X:%04X)" % (bank, offset & 0xFFFF)
+    if 0xE00000 <= addr < 0xF00000:
+        return "(SRAM +%04X)" % (addr - 0xE00000)
+    return ""
+
+
 def cmd_devices():
     """List everything SNI can see — hardware and emulators alike."""
     snes = Usb2Snes()
@@ -131,6 +190,7 @@ def cmd_scan(base=WRAM_BASE, size=LOWRAM_SIZE, delta=1, device=None):
     """Snapshot, wait for you to clear a level, report bytes that went up by `delta`."""
     snes = Usb2Snes(device_filter=device)
     print("Connected to:", snes.connect())
+    warn_if_wram_unavailable(snes)
     print("Scanning %06X-%06X" % (base, base + size - 1))
 
     before = snes.read(base, size)
@@ -140,12 +200,17 @@ def cmd_scan(base=WRAM_BASE, size=LOWRAM_SIZE, delta=1, device=None):
         input("\nClear a level that SHOULD count as an exit, then press Enter... ")
         after = snes.read(base, size)
         hits = {i for i in range(size) if after[i] == (before[i] + delta) & 0xFF}
+        changed = sum(1 for i in range(size) if after[i] != before[i])
         candidates = hits if candidates is None else (candidates & hits)
         before = after
 
+        # If nothing at all moved, the region isn't live — either the game
+        # doesn't use it (SA-1 relocates most of SMW's RAM) or you're reading
+        # the wrong address space.
+        print("%d of %d bytes changed at all" % (changed, size))
         print("%d candidate(s):" % len(candidates))
         for i in sorted(candidates)[:20]:
-            print("   %06X  (SNES $7E:%04X)  = %d" % (base + i, i, after[i]))
+            print("   %06X  %-14s = %d" % (base + i, snes_label(base + i), after[i]))
         if not candidates:
             print("Nothing incremented. See the SA-1 note at the bottom of this file.")
             return
@@ -171,6 +236,7 @@ def cmd_probe(counter_addr, gate_addr=0xF50100, device=None):
     """Show game mode and exit counter side by side, to pick a gate threshold."""
     snes = Usb2Snes(device_filter=device)
     print("Connected to:", snes.connect())
+    warn_if_wram_unavailable(snes)
     print("Move between title screen, file select, overworld and a level.")
     print("Note the mode value where the counter becomes trustworthy.\n")
     last = None
@@ -194,13 +260,14 @@ except ImportError:
 
 settings = {
     "source": "",
+    "profile": "vanilla",
     "url": DEFAULT_URL,
     "device": "",
     "address": "F51F2E",
     "gate_addr": "F50100",
     "gate_min": "0B",
     "gate_max": "1F",
-    "arm_mode": "0E",
+    "arm_mode": "0A,0E",
     "fallback_total": 96,
     "poll_ms": 200,
 }
@@ -222,9 +289,9 @@ def _poll_loop():
             gate_addr = int(settings["gate_addr"], 16) if settings["gate_addr"].strip() else None
             gate_min = int(settings["gate_min"], 16)
             gate_max = int(settings["gate_max"], 16) if settings["gate_max"].strip() else 0xFF
-            arm_mode = int(settings["arm_mode"], 16) if settings["arm_mode"].strip() else None
+            arm_modes = {int(m, 16) for m in settings["arm_mode"].replace(",", " ").split()}
             pending, pending_hits = None, 0
-            armed = arm_mode is None
+            armed = not arm_modes
             while state["run"]:
                 # Gate first: while the game mode says title screen or file
                 # select, WRAM holds nothing meaningful, so don't read at all.
@@ -234,6 +301,11 @@ def _poll_loop():
                     mode = snes.read_u8(gate_addr)
                     # A mode outside the valid range means WRAM is not holding
                     # real game state — during a ROM load it reads 0x55 filler.
+                    if mode == 0x55:
+                        with lock:
+                            state["status"] = "memory unavailable (SA-1 on hardware?)"
+                        time.sleep(settings["poll_ms"] / 1000.0)
+                        continue
                     if mode < gate_min or mode > gate_max:
                         armed = False
                         with lock:
@@ -246,9 +318,9 @@ def _poll_loop():
                     # still has the previous hack's junk in the counter byte.
                     # Only trust readings once the overworld has been reached,
                     # which the demo never does.
-                    if arm_mode is not None and mode == arm_mode:
+                    if mode in arm_modes:
                         armed = True
-                    if not armed:
+                    if arm_modes and not armed:
                         with lock:
                             state["status"] = "waiting for overworld (mode %02X)" % mode
                         time.sleep(settings["poll_ms"] / 1000.0)
@@ -360,33 +432,58 @@ def script_properties():
                 obs.obs_property_list_add_string(picker, name, name)
         obs.source_list_release(sources)
 
+    profile = obs.obs_properties_add_list(
+        props, "profile", "Hack type",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(profile, "Vanilla-base hack (WRAM)", "vanilla")
+    obs.obs_property_list_add_string(profile, "Custom addresses", "custom")
+    obs.obs_property_set_modified_callback(profile, _profile_changed)
+
     obs.obs_properties_add_text(props, "url", "SNI WebSocket URL", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_text(props, "device", "Device filter (blank = first found)", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_text(props, "address", "Counter address (hex)", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_text(props, "gate_addr", "Game mode address (hex, blank = off)", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_text(props, "gate_min", "Minimum game mode (hex)", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_text(props, "gate_max", "Maximum game mode (hex)", obs.OBS_TEXT_DEFAULT)
-    obs.obs_properties_add_text(props, "arm_mode", "Arm on game mode (hex, blank = off)", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_text(props, "arm_mode", "Arm on game modes (hex, comma-separated)", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_int(props, "fallback_total", "Fallback total exits", 1, 999, 1)
     obs.obs_properties_add_int(props, "poll_ms", "Poll interval (ms)", 50, 2000, 50)
     obs.obs_properties_add_text(props, "status", "Status", obs.OBS_TEXT_INFO)
     return props
 
 
+def _profile_changed(props, prop, data):
+    """Fill the address fields when a profile is picked, and hide them unless
+    the user explicitly wants to hand-edit."""
+    choice = obs.obs_data_get_string(data, "profile")
+    preset = PROFILES.get(choice)
+    if preset:
+        for key, value in preset.items():
+            obs.obs_data_set_string(data, key, value)
+    custom = preset is None
+    for key in ("address", "gate_addr", "gate_min", "gate_max", "arm_mode"):
+        target = obs.obs_properties_get(props, key)
+        if target:
+            obs.obs_property_set_visible(target, custom)
+    return True
+
+
 def script_defaults(data):
+    obs.obs_data_set_default_string(data, "profile", "vanilla")
     obs.obs_data_set_default_string(data, "url", DEFAULT_URL)
     obs.obs_data_set_default_string(data, "device", "")
     obs.obs_data_set_default_string(data, "address", "F51F2E")
     obs.obs_data_set_default_string(data, "gate_addr", "F50100")
     obs.obs_data_set_default_string(data, "gate_min", "0B")
     obs.obs_data_set_default_string(data, "gate_max", "1F")
-    obs.obs_data_set_default_string(data, "arm_mode", "0E")
+    obs.obs_data_set_default_string(data, "arm_mode", "0A,0E")
     obs.obs_data_set_default_int(data, "fallback_total", 96)
     obs.obs_data_set_default_int(data, "poll_ms", 200)
 
 
 def script_update(data):
     settings["source"] = obs.obs_data_get_string(data, "source")
+    settings["profile"] = obs.obs_data_get_string(data, "profile") or "vanilla"
     settings["url"] = obs.obs_data_get_string(data, "url")
     settings["device"] = obs.obs_data_get_string(data, "device")
     settings["address"] = obs.obs_data_get_string(data, "address").replace("$", "").strip()
@@ -396,6 +493,12 @@ def script_update(data):
     settings["arm_mode"] = obs.obs_data_get_string(data, "arm_mode").replace("$", "").strip()
     settings["fallback_total"] = obs.obs_data_get_int(data, "fallback_total")
     settings["poll_ms"] = obs.obs_data_get_int(data, "poll_ms")
+
+    # A named profile overrides whatever is sitting in the address boxes, so a
+    # stale hand-edit can't quietly survive a profile switch.
+    preset = PROFILES.get(settings["profile"])
+    if preset:
+        settings.update(preset)
 
     script_unload()
     with lock:
