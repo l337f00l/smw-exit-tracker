@@ -2,6 +2,8 @@
 
 Live exit counter for Super Mario World hack streams, reading the game's own exit total straight out of SNES memory — on real hardware or in an emulator.
 
+Built for vanilla-base hacks. ROMs using enhancement chips like SA-1 aren't supported; count those by hand.
+
 Point it at an OBS text source and your exit count updates the moment you clear a level — no hotkeys, no manual editing between attempts, no counting on stream.
 
 ```
@@ -119,16 +121,6 @@ Load a save file and the count should appear.
 
 That's the whole routine. Consider adding SNI to your Windows startup so step 2 stops being something to remember.
 
-## SA-1 hacks: not supported
-
-**SA-1 hacks aren't supported.** Count those exits by hand.
-
-On an FXPak Pro they can't work at all. The pak exposes memory to your PC by having its FPGA watch the SNES bus, and SNI's feature matrix for firmware v1.11.0 lists SA-1 among the chips where that mirror isn't available — alongside CX4, GSU, OBC1, S-DD1 and SGB. The pak plays SA-1 hacks perfectly; it just can't show your PC the memory while doing so. Confirmed by testing: every byte reads as constant `0x55` and never changes, even across a full level clear.
-
-Under emulation the memory is readable, but SA-1 relocates SMW's variables out of WRAM, so the stock addresses don't apply. Rather than ship a half-supported path, this tool sticks to vanilla-base hacks — which is the large majority of what gets made.
-
-*Experimenting anyway?* Choose **Custom addresses** in the OBS settings and run `scan` to find where your hack keeps its counter. Nothing stops you; it's just not a configuration this project supports or tests.
-
 ## Emulator support
 
 SNI supports emulators through two routes:
@@ -144,9 +136,11 @@ SNI supports emulators through two routes:
 
 **Wrong device attached.** With an emulator and a pak both connected, set the Device filter to part of the name you want.
 
-**Everything reads as `0x55` on an emulator.** Wrong core. SNI's connector reads BizHawk's System Bus memory domain, which the Snes9x core doesn't expose — switch to BSNES under Config → Cores → SNES, reload the ROM, and restart `Connector.lua`. BizHawk's Lua console shows `Unable to find domain: System Bus` when this is the problem.
+**Everything reads as `0x55`.** On an emulator, this is the wrong core. SNI's connector reads BizHawk's System Bus memory domain, which the Snes9x core doesn't expose — switch to BSNES under Config → Cores → SNES, reload the ROM, and restart `Connector.lua`. BizHawk's Lua console shows `Unable to find domain: System Bus` when this is the problem. On hardware, it means the ROM uses an enhancement chip the pak can't mirror — not supported.
 
 **Script won't load in OBS.** Almost always `websocket-client` installed to the wrong Python. Recheck the interpreter path in Tools → Scripts → Python Settings.
+
+**Number doesn't move after a clear.** Re-clearing a level you've already beaten doesn't add an exit — the game only counts each one once. Test on a level you haven't cleared on that save file.
 
 **Number is stuck.** The script won't trust readings until it sees one of the arm modes. Hub-world hacks with no overworld never reach mode `0E`, which is why `0A` (file load) is in the default list. If a hack still won't arm, run `probe`, note which modes actually appear, and add one that only occurs after a file is loaded — or clear the field entirely to disable arming.
 
