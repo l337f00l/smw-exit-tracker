@@ -2,7 +2,8 @@
 smw_exit_tracker.py — live Super Mario World exit counter for OBS.
 
 Reads the exit counter straight out of SNES RAM over USB (FXPak Pro / sd2snes
-via SNI), so the hack's own logic decides what counts as an exit. Levels the
+or an emulator, via SNI), so the hack's own logic decides what counts as an
+exit. Built for vanilla-base hacks. Levels the
 author marked as non-counting — switch palaces, bonus rooms — are filtered for
 free, and keyhole/orb exits register the same as goal tape.
 
@@ -28,6 +29,7 @@ Address spaces in the FX Pak Pro map (pass these to `scan --base`):
 """
 
 import json
+import os
 import re
 import threading
 import time
@@ -48,6 +50,10 @@ APP_NAME = "SMW Exit Overlay"
 PROFILES = {
     "vanilla": {"address": "F51F2E", "gate_addr": "F50100", "arm_mode": "0A,0E"},
 }
+
+# Where the counter cache lives, so a hack you swap back to shows its last
+# known count immediately instead of a blank.
+CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exit_cache.json")
 
 DEVICE_ALIASES = {
     "bizhawk": "luabridge",
@@ -128,6 +134,15 @@ class Usb2Snes:
     def read_u8(self, addr):
         return self.read(addr, 1)[0]
 
+    def read_rom_title(self, addr=0x007FC0):
+        """The ROM's internal name — a stable identity for the loaded hack."""
+        try:
+            raw = self.read(addr, 21)
+        except Exception:
+            return None
+        title = "".join(chr(b) for b in raw if 32 <= b < 127).strip()
+        return title or None
+
     def close(self):
         try:
             if self.ws:
@@ -142,11 +157,7 @@ class Usb2Snes:
 # --------------------------------------------------------------------------
 
 def warn_if_wram_unavailable(snes):
-    """Detect the 0x55 filler that means the WRAM mirror isn't populated.
-
-    On an FXPak Pro this is what SA-1 hacks look like: the pak plays them fine,
-    but its FPGA can't expose their memory, so every byte reads as filler.
-    """
+    """Detect the 0x55 filler that means memory isn't actually being exposed."""
     try:
         sample = snes.read(WRAM_BASE, 0x40)
     except Exception:
@@ -154,14 +165,14 @@ def warn_if_wram_unavailable(snes):
     if len(set(sample)) == 1:
         print("\n  !! Memory reads as constant 0x%02X — nothing real is being"
               " exposed here.\n" % sample[0])
-        print("     On an FXPak Pro: expected for SA-1 hacks. The pak plays")
-        print("     them but cannot mirror their RAM. Use an emulator instead.\n")
         print("     On an emulator: usually the wrong core. SNI's connector")
         print("     reads through BizHawk's System Bus domain, which the")
         print("     Snes9x core does not expose. Switch to BSNES under")
         print("     Config -> Cores -> SNES, reload the ROM, and restart the")
         print("     connector script. Check BizHawk's Lua console for")
         print("     'Unable to find domain: System Bus'.\n")
+        print("     On an FXPak Pro: the ROM uses an enhancement chip whose")
+        print("     memory the pak cannot mirror. Not supported.\n")
         return True
     return False
 
@@ -186,6 +197,19 @@ def cmd_devices():
     print("\nPass part of a name to --device to pin one, e.g. --device fxpak")
 
 
+def cmd_title(addr=0x007FC0, device=None):
+    """Print the ROM's internal title — the key used for per-hack counts."""
+    snes = Usb2Snes(device_filter=device)
+    print("Connected to:", snes.connect())
+    title = snes.read_rom_title(addr)
+    if title:
+        print("ROM title: %r" % title)
+        print("\nIf that looks like the hack you're running, per-hack counts will work.")
+    else:
+        print("No readable title at %06X." % addr)
+        print("Try 00FFC0 for a HiROM hack, or leave the field blank in OBS to disable.")
+
+
 def cmd_scan(base=WRAM_BASE, size=LOWRAM_SIZE, delta=1, device=None):
     """Snapshot, wait for you to clear a level, report bytes that went up by `delta`."""
     snes = Usb2Snes(device_filter=device)
@@ -205,14 +229,14 @@ def cmd_scan(base=WRAM_BASE, size=LOWRAM_SIZE, delta=1, device=None):
         before = after
 
         # If nothing at all moved, the region isn't live — either the game
-        # doesn't use it (SA-1 relocates most of SMW's RAM) or you're reading
-        # the wrong address space.
+        # doesn't use it, or you're reading the wrong address space.
         print("%d of %d bytes changed at all" % (changed, size))
         print("%d candidate(s):" % len(candidates))
         for i in sorted(candidates)[:20]:
             print("   %06X  %-14s = %d" % (base + i, snes_label(base + i), after[i]))
         if not candidates:
-            print("Nothing incremented. See the SA-1 note at the bottom of this file.")
+            print("Nothing incremented. Check that the level actually counted —")
+            print("re-clearing a level you have already beaten does not add an exit.")
             return
         if len(candidates) <= 3:
             print("\nNarrow enough — verify with:  python smw_exit_tracker.py watch %06X"
@@ -268,11 +292,49 @@ settings = {
     "gate_min": "0B",
     "gate_max": "1F",
     "arm_mode": "0A,0E",
+    "trigger_addr": "F51493",
+    "trigger_min": "0E",
+    "rom_addr": "007FC0",
+    "burst_ms": 50,
+    "burst_seconds": 5,
     "fallback_total": 96,
     "poll_ms": 200,
 }
-state = {"count": None, "total": None, "run": False, "thread": None, "status": "idle"}
+state = {"count": None, "total": None, "rom": None,
+         "run": False, "thread": None, "status": "idle"}
 lock = threading.Lock()
+
+
+def _load_cache():
+    try:
+        with open(CACHE_PATH) as handle:
+            return json.load(handle)
+    except Exception:
+        return {}
+
+
+def _save_cache(cache):
+    try:
+        with open(CACHE_PATH, "w") as handle:
+            json.dump(cache, handle, indent=1)
+    except Exception:
+        pass  # cache is a convenience, never load-bearing
+
+
+def _set_status(text):
+    """Record status and log transitions, so the Script Log shows what's wrong."""
+    with lock:
+        changed = state["status"] != text
+        state["status"] = text
+    if changed and obs:
+        obs.script_log(obs.LOG_INFO, "[exit tracker] %s" % text)
+
+
+def _interval(burst_until):
+    """Poll fast for a few seconds after a level ends, idle the rest of the time."""
+    if time.time() < burst_until:
+        return settings["burst_ms"] / 1000.0
+    return settings["poll_ms"] / 1000.0
 
 
 def _poll_loop():
@@ -283,16 +345,38 @@ def _poll_loop():
         try:
             snes.connect()
             backoff = 1.0
-            with lock:
-                state["status"] = "connected"
+            _set_status("connected")
             addr = int(settings["address"], 16)
             gate_addr = int(settings["gate_addr"], 16) if settings["gate_addr"].strip() else None
             gate_min = int(settings["gate_min"], 16)
             gate_max = int(settings["gate_max"], 16) if settings["gate_max"].strip() else 0xFF
             arm_modes = {int(m, 16) for m in settings["arm_mode"].replace(",", " ").split()}
+            trig_addr = int(settings["trigger_addr"], 16) if settings["trigger_addr"].strip() else None
+            trig_min = int(settings["trigger_min"], 16)
+            rom_addr = int(settings["rom_addr"], 16) if settings["rom_addr"].strip() else None
             pending, pending_hits = None, 0
             armed = not arm_modes
+            cache = _load_cache()
+            trig_high = False
+            burst_until = 0.0
+            next_rom_check = 0.0
             while state["run"]:
+                # Which hack is loaded? The ROM's internal title is stable
+                # identity — unlike the exit total, two hacks can't collide on
+                # it. On a swap, show that hack's last known count right away
+                # and re-arm so a live read replaces it.
+                now = time.time()
+                if rom_addr is not None and now >= next_rom_check:
+                    next_rom_check = now + 2.0
+                    title = snes.read_rom_title(rom_addr)
+                    with lock:
+                        known = state["rom"]
+                    if title and title != known:
+                        armed = False
+                        with lock:
+                            state["rom"] = title
+                            state["count"] = cache.get(title)
+
                 # Gate first: while the game mode says title screen or file
                 # select, WRAM holds nothing meaningful, so don't read at all.
                 # Once a file is loaded, whatever the counter says is the truth —
@@ -302,15 +386,13 @@ def _poll_loop():
                     # A mode outside the valid range means WRAM is not holding
                     # real game state — during a ROM load it reads 0x55 filler.
                     if mode == 0x55:
-                        with lock:
-                            state["status"] = "memory unavailable (SA-1 on hardware?)"
-                        time.sleep(settings["poll_ms"] / 1000.0)
+                        _set_status("memory unavailable — check emulator core")
+                        time.sleep(_interval(burst_until))
                         continue
                     if mode < gate_min or mode > gate_max:
                         armed = False
-                        with lock:
-                            state["status"] = "holding (mode %02X)" % mode
-                        time.sleep(settings["poll_ms"] / 1000.0)
+                        _set_status("holding — no file loaded (mode %02X)" % mode)
+                        time.sleep(_interval(burst_until))
                         continue
 
                     # The title screen demo plays a real level, so it clears the
@@ -321,13 +403,24 @@ def _poll_loop():
                     if mode in arm_modes:
                         armed = True
                     if arm_modes and not armed:
-                        with lock:
-                            state["status"] = "waiting for overworld (mode %02X)" % mode
-                        time.sleep(settings["poll_ms"] / 1000.0)
+                        _set_status("waiting to arm (mode %02X)" % mode)
+                        time.sleep(_interval(burst_until))
                         continue
 
-                    with lock:
-                        state["status"] = "connected (mode %02X)" % mode
+                    _set_status("reading (mode %02X)" % mode)
+
+                # The end-of-level trigger fires the instant a level ends,
+                # well before the counter itself settles. Treat it as "look
+                # now", not as "add one" — the counter still decides whether
+                # this exit counts, so a non-counting switch palace produces a
+                # burst of reads and no change, which is exactly right.
+                if trig_addr is not None:
+                    trig = snes.read_u8(trig_addr)
+                    if trig > trig_min and not trig_high:
+                        burst_until = time.time() + settings["burst_seconds"]
+                        trig_high = True
+                    elif trig <= trig_min:
+                        trig_high = False
 
                 value = snes.read_u8(addr)
 
@@ -337,7 +430,7 @@ def _poll_loop():
                 # is torn — re-check the mode and throw it away if so.
                 recheck = snes.read_u8(gate_addr) if gate_addr is not None else None
                 if recheck is not None and not (gate_min <= recheck <= gate_max):
-                    time.sleep(settings["poll_ms"] / 1000.0)
+                    time.sleep(_interval(burst_until))
                     continue
 
                 with lock:
@@ -361,11 +454,20 @@ def _poll_loop():
                     pending, pending_hits = None, 0
                     with lock:
                         state["count"] = value
+                        title = state["rom"]
+                    if last != value and obs:
+                        obs.script_log(obs.LOG_INFO,
+                                       "[exit tracker] count = %s" % value)
+                    if title and cache.get(title) != value:
+                        cache[title] = value
+                        _save_cache(cache)
+                    # Counter moved, so whatever the burst was waiting for has
+                    # landed — no reason to keep hammering.
+                    burst_until = 0.0
 
-                time.sleep(settings["poll_ms"] / 1000.0)
+                time.sleep(_interval(burst_until))
         except Exception as exc:
-            with lock:
-                state["status"] = "reconnecting: %s" % exc
+            _set_status("reconnecting: %s" % exc)
             time.sleep(backoff)
             backoff = min(backoff * 2, 15.0)
         finally:
@@ -396,7 +498,10 @@ def _tick():
         with lock:
             previous_total = state.get("total")
             state["total"] = total
-            if previous_total is not None and total != previous_total:
+            # ROM identity handles swaps properly when it's available; this is
+            # the fallback for setups where the title read doesn't work.
+            if (state["rom"] is None and previous_total is not None
+                    and total != previous_total):
                 state["count"] = None
                 return
 
@@ -448,6 +553,11 @@ def script_properties():
     obs.obs_properties_add_text(props, "arm_mode", "Arm on game modes (hex, comma-separated)", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_int(props, "fallback_total", "Fallback total exits", 1, 999, 1)
     obs.obs_properties_add_int(props, "poll_ms", "Poll interval (ms)", 50, 2000, 50)
+    obs.obs_properties_add_text(props, "trigger_addr", "Level-end trigger address (hex, blank = off)", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_text(props, "trigger_min", "Trigger fires above (hex)", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_text(props, "rom_addr", "ROM title address (hex, blank = off)", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_int(props, "burst_ms", "Burst poll interval (ms)", 20, 500, 10)
+    obs.obs_properties_add_int(props, "burst_seconds", "Burst duration (s)", 1, 30, 1)
     obs.obs_properties_add_text(props, "status", "Status", obs.OBS_TEXT_INFO)
     return props
 
@@ -460,11 +570,6 @@ def _profile_changed(props, prop, data):
     if preset:
         for key, value in preset.items():
             obs.obs_data_set_string(data, key, value)
-    custom = preset is None
-    for key in ("address", "gate_addr", "gate_min", "gate_max", "arm_mode"):
-        target = obs.obs_properties_get(props, key)
-        if target:
-            obs.obs_property_set_visible(target, custom)
     return True
 
 
@@ -479,6 +584,11 @@ def script_defaults(data):
     obs.obs_data_set_default_string(data, "arm_mode", "0A,0E")
     obs.obs_data_set_default_int(data, "fallback_total", 96)
     obs.obs_data_set_default_int(data, "poll_ms", 200)
+    obs.obs_data_set_default_string(data, "trigger_addr", "F51493")
+    obs.obs_data_set_default_string(data, "trigger_min", "0E")
+    obs.obs_data_set_default_string(data, "rom_addr", "007FC0")
+    obs.obs_data_set_default_int(data, "burst_ms", 50)
+    obs.obs_data_set_default_int(data, "burst_seconds", 5)
 
 
 def script_update(data):
@@ -493,6 +603,11 @@ def script_update(data):
     settings["arm_mode"] = obs.obs_data_get_string(data, "arm_mode").replace("$", "").strip()
     settings["fallback_total"] = obs.obs_data_get_int(data, "fallback_total")
     settings["poll_ms"] = obs.obs_data_get_int(data, "poll_ms")
+    settings["trigger_addr"] = obs.obs_data_get_string(data, "trigger_addr").replace("$", "").strip()
+    settings["trigger_min"] = obs.obs_data_get_string(data, "trigger_min").replace("$", "").strip() or "0"
+    settings["rom_addr"] = obs.obs_data_get_string(data, "rom_addr").replace("$", "").strip()
+    settings["burst_ms"] = obs.obs_data_get_int(data, "burst_ms")
+    settings["burst_seconds"] = obs.obs_data_get_int(data, "burst_seconds")
 
     # A named profile overrides whatever is sitting in the address boxes, so a
     # stale hand-edit can't quietly survive a profile switch.
@@ -504,6 +619,7 @@ def script_update(data):
     with lock:
         state["count"] = None
         state["total"] = None
+        state["rom"] = None
     state["run"] = True
     state["thread"] = threading.Thread(target=_poll_loop, daemon=True)
     state["thread"].start()
@@ -542,13 +658,18 @@ if __name__ == "__main__":
     probe.add_argument("address", help="counter address, e.g. F51F2E")
     probe.add_argument("--gate", default="F50100")
 
-    for sub_parser in (scan, watch, probe):
+    title = sub.add_parser("title", help="print the loaded ROM's internal title")
+    title.add_argument("--address", default="007FC0")
+
+    for sub_parser in (scan, watch, probe, title):
         sub_parser.add_argument("--device", default=None,
                                 help="substring of the device name, e.g. fxpak or bizhawk")
 
     args = parser.parse_args()
     if args.cmd == "devices":
         cmd_devices()
+    elif args.cmd == "title":
+        cmd_title(int(args.address, 16), args.device)
     elif args.cmd == "scan":
         cmd_scan(int(args.base, 16), int(args.size, 16), args.delta, args.device)
     elif args.cmd == "probe":
