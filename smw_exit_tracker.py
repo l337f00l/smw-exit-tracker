@@ -297,6 +297,7 @@ settings = {
     "rom_addr": "007FC0",
     "burst_ms": 50,
     "burst_seconds": 5,
+    "arm_after_s": 10,
     "fallback_total": 96,
     "poll_ms": 200,
 }
@@ -321,11 +322,19 @@ def _save_cache(cache):
         pass  # cache is a convenience, never load-bearing
 
 
-def _set_status(text):
-    """Record status and log transitions, so the Script Log shows what's wrong."""
+_last_logged = {}
+
+
+def _set_status(text, channel="poll"):
+    """Record status and log transitions, so the Script Log shows what's wrong.
+
+    Channels are tracked separately: the poll thread and the timer callback
+    alternate, and a shared last-value would log every single line.
+    """
     with lock:
-        changed = state["status"] != text
         state["status"] = text
+        changed = _last_logged.get(channel) != text
+        _last_logged[channel] = text
     if changed and obs:
         obs.script_log(obs.LOG_INFO, "[exit tracker] %s" % text)
 
@@ -356,6 +365,8 @@ def _poll_loop():
             rom_addr = int(settings["rom_addr"], 16) if settings["rom_addr"].strip() else None
             pending, pending_hits = None, 0
             armed = not arm_modes
+            valid_since = None
+            disarm_below = min([gate_min] + sorted(arm_modes)) if arm_modes else gate_min
             cache = _load_cache()
             trig_high = False
             burst_until = 0.0
@@ -386,22 +397,47 @@ def _poll_loop():
                     # A mode outside the valid range means WRAM is not holding
                     # real game state — during a ROM load it reads 0x55 filler.
                     if mode == 0x55:
-                        _set_status("memory unavailable — check emulator core")
+                        _set_status("memory not readable yet (ROM loading?)")
                         time.sleep(_interval(burst_until))
                         continue
-                    if mode < gate_min or mode > gate_max:
+
+                    # Reset, menu or boot: drop back to disarmed. This
+                    # threshold sits below the lowest arm mode, so arming on a
+                    # mode that is itself too early to read from (file load, on
+                    # hub-world hacks with no overworld) still works.
+                    if mode < disarm_below or mode > gate_max:
                         armed = False
+                        valid_since = None
                         _set_status("holding — no file loaded (mode %02X)" % mode)
                         time.sleep(_interval(burst_until))
                         continue
 
-                    # The title screen demo plays a real level, so it clears the
-                    # gate while no file is loaded — and a freshly swapped ROM
-                    # still has the previous hack's junk in the counter byte.
-                    # Only trust readings once the overworld has been reached,
-                    # which the demo never does.
+                    # Arm BEFORE the read gate. The title screen demo plays a
+                    # real level, so it clears the gate while no file is
+                    # loaded — arming is what keeps that out.
                     if mode in arm_modes:
+                        if not armed:
+                            _set_status("armed (mode %02X)" % mode)
                         armed = True
+                        valid_since = None
+                    elif not armed:
+                        # Fallback: the arm modes only occur at boot, so
+                        # loading this script mid-session would otherwise wait
+                        # forever. Sustained valid game modes mean a game is
+                        # genuinely running.
+                        dwell = settings["arm_after_s"]
+                        if valid_since is None:
+                            valid_since = time.time()
+                        elif dwell and time.time() - valid_since >= dwell:
+                            armed = True
+                            valid_since = None
+                            _set_status("armed after %ds of play" % dwell)
+
+                    if mode < gate_min:
+                        _set_status("waiting for game to start (mode %02X)" % mode)
+                        time.sleep(_interval(burst_until))
+                        continue
+
                     if arm_modes and not armed:
                         _set_status("waiting to arm (mode %02X)" % mode)
                         time.sleep(_interval(burst_until))
@@ -476,6 +512,13 @@ def _poll_loop():
 
 def _tick():
     """Runs on the OBS main thread. Rewrites only the left half of 'Exits xx/yy'."""
+    try:
+        _tick_inner()
+    except Exception as exc:
+        _set_status("update failed: %s" % exc, channel="tick")
+
+
+def _tick_inner():
     with lock:
         count = state["count"]
     if count is None:
@@ -483,6 +526,8 @@ def _tick():
 
     source = obs.obs_get_source_by_name(settings["source"])
     if source is None:
+        _set_status("text source %r not found — pick it in the script settings"
+                    % settings["source"], channel="tick")
         return
     try:
         data = obs.obs_source_get_settings(source)
@@ -513,6 +558,8 @@ def _tick():
             obs.obs_data_set_string(update, "text", new_text)
             obs.obs_source_update(source, update)
             obs.obs_data_release(update)
+            obs.script_log(obs.LOG_INFO, "[exit tracker] wrote %r (was %r)"
+                           % (new_text, current.strip()))
     finally:
         obs.obs_source_release(source)
 
@@ -558,6 +605,7 @@ def script_properties():
     obs.obs_properties_add_text(props, "rom_addr", "ROM title address (hex, blank = off)", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_int(props, "burst_ms", "Burst poll interval (ms)", 20, 500, 10)
     obs.obs_properties_add_int(props, "burst_seconds", "Burst duration (s)", 1, 30, 1)
+    obs.obs_properties_add_int(props, "arm_after_s", "Arm after N seconds of play (0 = off)", 0, 120, 1)
     obs.obs_properties_add_text(props, "status", "Status", obs.OBS_TEXT_INFO)
     return props
 
@@ -589,6 +637,7 @@ def script_defaults(data):
     obs.obs_data_set_default_string(data, "rom_addr", "007FC0")
     obs.obs_data_set_default_int(data, "burst_ms", 50)
     obs.obs_data_set_default_int(data, "burst_seconds", 5)
+    obs.obs_data_set_default_int(data, "arm_after_s", 10)
 
 
 def script_update(data):
@@ -608,6 +657,7 @@ def script_update(data):
     settings["rom_addr"] = obs.obs_data_get_string(data, "rom_addr").replace("$", "").strip()
     settings["burst_ms"] = obs.obs_data_get_int(data, "burst_ms")
     settings["burst_seconds"] = obs.obs_data_get_int(data, "burst_seconds")
+    settings["arm_after_s"] = obs.obs_data_get_int(data, "arm_after_s")
 
     # A named profile overrides whatever is sitting in the address boxes, so a
     # stale hand-edit can't quietly survive a profile switch.

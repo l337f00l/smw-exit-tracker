@@ -111,7 +111,13 @@ Load a save file and the count should appear.
 | Maximum game mode | `1F` | Above this, the value isn't a real mode |
 | Arm on game modes | `0A,0E` | Comma-separated; one must be seen before trusting reads |
 | Fallback total | `96` | Used if the text source has no `/total` |
-| Poll interval | `200` ms | How often to read |
+| Poll interval | `200` ms | How often to read while idle |
+| Level-end trigger address | `F51493` | End-of-level timer; fires the fast-poll burst |
+| Trigger fires above | `0E` | The timer is set high then counts down |
+| Burst poll interval | `50` ms | Read rate for a few seconds after a level ends |
+| Burst duration | `5` s | How long to keep polling fast |
+| Arm after N seconds | `10` | Fallback arming for hacks with no overworld |
+| ROM title address | `007FC0` | Identifies the loaded hack for per-hack counts |
 
 ## Streaming checklist
 
@@ -132,7 +138,9 @@ SNI supports emulators through two routes:
 
 ## Troubleshooting
 
-**Nothing appears at all.** Run `python smw_exit_tracker.py devices` — if your console or emulator isn't listed, the problem is between SNI and the game, not this script. On emulator, that usually means the connector Lua script isn't running. Then try `probe`, which fails with a clear error, unlike the OBS script, which quietly retries.
+**Nothing appears at all.** First check the Script Log — most causes name themselves there, including an unset text source.
+
+**Still nothing.** Run `python smw_exit_tracker.py devices` — if your console or emulator isn't listed, the problem is between SNI and the game, not this script. On emulator, that usually means the connector Lua script isn't running. Then try `probe`, which fails with a clear error, unlike the OBS script, which quietly retries.
 
 **Wrong device attached.** With an emulator and a pak both connected, set the Device filter to part of the name you want.
 
@@ -142,7 +150,7 @@ SNI supports emulators through two routes:
 
 **Number doesn't move after a clear.** Re-clearing a level you've already beaten doesn't add an exit — the game only counts each one once. Test on a level you haven't cleared on that save file.
 
-**Number is stuck.** The script won't trust readings until it sees one of the arm modes. Hub-world hacks with no overworld never reach mode `0E`, which is why `0A` (file load) is in the default list. If a hack still won't arm, run `probe`, note which modes actually appear, and add one that only occurs after a file is loaded — or clear the field entirely to disable arming.
+**Number is stuck.** Check the Script Log (Tools → Scripts → Script Log) — it reports what the script is doing every time that changes: whether it's connected, which game mode it sees, whether it's armed, and every write it makes. `waiting to arm` for more than about ten seconds means the arming fallback is disabled or set too high.
 
 **Wrong number briefly on hack swap.** Should be handled, but if it persists, the total in your text source may not have changed — the swap detection keys off that. Clearing and resetting the counter address in the script settings forces a reset.
 
@@ -153,10 +161,11 @@ SNI supports emulators through two routes:
 Every poll, the script reads two bytes over USB: a game mode byte and the exit counter. Several guards decide whether the reading is trustworthy:
 
 - **Range check.** During a ROM load, WRAM reads as `0x55` filler. A mode outside the valid range means the memory isn't holding real game state.
-- **Arming.** The title screen demo plays an actual level, so it clears a naive mode check while no file is loaded — and a freshly loaded ROM still holds the previous hack's leftovers. Readings are only trusted after the overworld has been reached, which the demo never does.
 - **Re-check after reading.** The two bytes are separate USB round trips. If the console left the game in between, the sample is torn and gets thrown away.
 - **Drop confirmation.** A decrease has to persist across several reads before it's accepted, riding out garbage during a file load.
-- **Swap detection.** If the total in the text source changes, a new hack was loaded and the held count is dropped rather than carried over.
+- **Swap detection.** The ROM's internal title identifies the loaded hack. On a swap, that hack's last known count is restored from a small `exit_cache.json` beside the script, then confirmed by a live read — so switching back and forth doesn't lose your place. If the title can't be read, a change in the text source's total is used as a fallback signal.
+- **Instant updates.** SMW's end-of-level timer fires the moment a level ends, so the script switches to fast polling for a few seconds around each clear. The counter still decides: a level the hack doesn't count produces a burst of reads and no change on screen, never a number that has to be taken back.
+- **Arming.** Readings are only trusted after a file is genuinely loaded — signalled by the overworld or file-load game modes, or by sustained normal play for hacks that have neither. This keeps the title screen demo and freshly swapped ROMs from being read as real values.
 
 Console resets hold the last known value until a file is loaded again, rather than flashing zero on stream.
 
