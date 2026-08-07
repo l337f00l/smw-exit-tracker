@@ -136,6 +136,54 @@ SNI supports emulators through two routes:
 
 **MesenCE is not supported.** SNI has no driver for it, and Mesen's Lua API doesn't provide the socket support a bridge connector would need. If you want a Mesen-family emulator to work with SNI, that request belongs upstream with SNI or MesenCE, not here.
 
+## Platform notes
+
+Developed and tested on Windows. The script is plain Python and SNI ships builds for all three platforms, so macOS and Linux should work — the friction is in getting OBS to load Python and in USB permissions, not in the script itself. Reports from either platform are welcome.
+
+### macOS
+
+**OBS Python.** This is the fiddly part. OBS needs a Python framework it can load, and Homebrew's packaging frequently omits the `Current` symlink OBS looks for — supported versions then silently fail to load. Install Python from [python.org](https://www.python.org/downloads/) instead, then in **Tools → Scripts → Python Settings** point OBS at `/Library/Frameworks` (older OBS builds want the specific version folder, e.g. `/Library/Frameworks/Python.framework/Versions/3.11`). OBS 31.1 and later handle Homebrew Python better, but the python.org install is still the path of least resistance.
+
+Install the dependency with that same interpreter:
+
+```
+/Library/Frameworks/Python.framework/Versions/3.11/bin/python3 -m pip install websocket-client
+```
+
+**SNI.** Grab the macOS build. It's unsigned, so the first launch needs a right-click → Open to get past Gatekeeper.
+
+**FXPak Pro.** Appears as `/dev/cu.usbmodem*` with no driver needed; SNI finds it automatically.
+
+**Emulators.** BizHawk has no macOS build, so RetroArch with a bsnes-mercury core is the native option. Running BizHawk under CrossOver or Wine is untested — see the note below.
+
+### Linux
+
+**OBS Python.** Install OBS from your distro's packages rather than Flatpak if you can; the sandboxed build makes Python scripting and its dependencies considerably more awkward. Then:
+
+```
+python3 -m pip install --user websocket-client
+```
+
+Match the interpreter to whatever **Tools → Scripts → Python Settings** reports.
+
+**FXPak Pro.** The pak is a USB serial device, usually `/dev/ttyACM0`, and your user needs permission to open it:
+
+```
+sudo usermod -aG dialout $USER
+```
+
+Log out and back in for that to take effect. Without it, SNI simply won't list the device — which looks identical to the cable being unplugged.
+
+**SNI.** Download the Linux build and `chmod +x` it before running.
+
+**Emulators.** BizHawk supports Linux natively — use `EmuHawkMono.sh` rather than reaching for Wine. RetroArch works too.
+
+### BizHawk under Wine
+
+Untested, but it should work in principle. SNI's connector talks to `127.0.0.1:23074`, and Wine shares the host network stack, so a Windows-side Lua script reaching a native SNI process is a normal case rather than an exotic one. The connector also loads a Windows luasocket DLL, which is exactly the kind of thing Wine handles.
+
+Two reasons to prefer native anyway: BizHawk already runs natively on Linux, making Wine pointless there; and on macOS, translation layers add input latency, which matters more for kaizo than for most things. If you try it, the result is worth an issue either way.
+
 ## Troubleshooting
 
 **Nothing appears at all.** First check the Script Log — most causes name themselves there, including an unset text source.
